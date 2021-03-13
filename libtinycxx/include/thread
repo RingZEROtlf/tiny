@@ -1,0 +1,581 @@
+#ifndef _LIBTINYCXX_THREAD
+#define _LIBTINYCXX_THREAD
+
+#if __cplusplus < 201103L
+#error Requires compiler and library support for the ISO C++ 2011 standard.
+#else
+
+/**
+ * [thread.threads]
+ * [thread.threads] describes components that can be used to create and manage threads.
+ */
+
+#include <pthread.h>
+
+#include <ostream>        // std::basic_ostream
+#include <chrono>         // std::chrono::*
+#include <functional>     // std::hash, std::reference_wrapper
+#include <system_error>   // std::system_error, std::generic_category
+#include <type_traits>    // std::false_type, std::true_type,
+                          // std::is_integral, std::is_base_of, std::decay
+                          // std::enable_if, std::is_function
+#include <utility>        // std::forward, std::move, std::declval
+#include <tuple>          // std::tuple, std::tuple_size, std::get
+#include <algorithm>      // std::swap
+#include <exception>      // std::terminate
+
+#include <time.h>         //
+#include <errno.h>        //
+#include <sys/sysinfo.h>  // get_nprocs()
+
+namespace tiny {
+  namespace detail {
+    template <class T, T... Ints>
+      struct integer_sequence {
+        typedef T value_type;
+
+        static_assert(
+          std::is_integral<T>::value,
+          "tiny::detail::integer_sequence can only be instantiated with an integeral type");
+        
+        static inline std::size_t size() {
+          return sizeof...(Ints);
+        }
+      };
+
+    template <std::size_t... Ints>
+      using index_sequence = integer_sequence<std::size_t, Ints...>;
+
+    template <class T, T N>
+      using make_integer_sequence = integer_sequence<T, __integer_pack(N)...>;
+
+    template <std::size_t N>
+      using make_index_sequence = make_integer_sequence<std::size_t, N>;
+
+    template <class... T>
+      using index_sequence_for = make_index_sequence<sizeof...(T)>;
+
+    template <class T>
+      struct is_reference_wrapper : std::false_type {};
+
+    template <class U>
+      struct is_reference_wrapper<std::reference_wrapper<U>> : std::true_type {};
+
+    template <class T>
+      struct invoke_impl {
+        template<class F, class... Args>
+          static auto call(F&& f, Args&&... args)
+              -> decltype(std::forward<F>(f)(std::forward<Args>(args)...)) {
+            return std::forward<F>(f)(std::forward<Args>(args)...);
+          }
+      };
+
+    template <class BaseT, class MemberT>
+      struct invoke_impl<MemberT BaseT::*> {
+        template <class T,
+            class = typename std::enable_if<
+                std::is_base_of<BaseT, typename std::decay<T>::type>::value
+            >::type
+        >
+          static auto get(T&& t) -> T&& {
+            return std::forward<T>(t);
+          }
+
+        template <class T,
+            class = typename std::enable_if<
+                is_reference_wrapper<typename std::decay<T>::type>::value
+            >::type
+        >
+          static auto get(T&& t) -> decltype(t.get()) {
+            return t.get();
+          }
+
+        template <class T,
+            class = typename std::enable_if<
+                !std::is_base_of<BaseT, typename std::decay<T>::type>::value
+            >::type,
+            class = typename std::enable_if<
+                !is_reference_wrapper<typename std::decay<T>::type>::value
+            >::type
+        >
+          static auto get(T&& t) -> decltype(*std::forward<T>(t)) {
+            return *std::forward<T>(t);
+          }
+
+        template <class T, class... Args, class MemberT1,
+            class = typename std::enable_if<
+                std::is_function<MemberT1>::value
+            >::type
+        >
+          static auto call(MemberT1 BaseT::*pmf, T&& t, Args&&... args)
+              -> decltype((invoke_impl::get(std::forward<T>(t)).*pmf)(std::forward<Args>(args)...)) {
+            return (invoke_impl::get(std::forward<T>(t)).*pmf)(std::forward<Args>(args)...);
+          }
+
+        template <class T>
+          static auto call(MemberT BaseT::*pmd, T&& t)
+              -> decltype(invoke_impl::get(std::forward<T>(t)).*pmd) {
+            return invoke_impl::get(std::forward<T>(t)).*pmd;
+          }
+      };
+
+    template <class F, class... Args>
+      auto INVOKE(F&& f, Args&&... args)
+          -> decltype(invoke_impl<typename std::decay<F>::type>::call(
+              std::forward<F>(f), std::forward<Args>(args)...)) {
+        return invoke_impl<typename std::decay<F>::type>::call(
+            std::forward<F>(f), std::forward<Args>(args)...);
+      }
+
+    // Minimal C++11 implementation:
+    template <class> struct result_of;
+
+    template <class F, class... Args>
+      struct result_of<F(Args...)> {
+        using type = decltype(INVOKE(std::declval<F>(), std::declval<Args>()...));
+      };
+
+    template <class T> typename std::decay<T>::type decay_copy(T&& v)
+      { return std::forward<T>(v); }
+
+    template <class F, class... Args>
+      struct thread_invoker {
+        using result_of_t = typename result_of<F(Args...)>::type;
+        using decayed_tuple = std::tuple<typename std::decay<F>::type, typename std::decay<Args>::type...>;
+        decayed_tuple tuple_;
+
+        thread_invoker(F&& f, Args&&... args)
+          : tuple_{ decay_copy(std::forward<F>(f)), decay_copy(std::forward<Args>(args))... }
+        { }
+
+        template <std::size_t... Indices>
+          result_of_t invoke(index_sequence<Indices...>) {
+            return INVOKE(std::get<Indices>(std::move(tuple_))...);
+          }
+
+        result_of_t operator()() {
+          using indices = make_index_sequence<std::tuple_size<decayed_tuple>::value>;
+          return invoke(indices());
+        }
+      };
+
+    struct thread_state_base {
+      virtual ~thread_state_base() { }
+      virtual void run() = 0;
+    };
+
+    template <class Callable>
+      struct thread_state_impl : public thread_state_base {
+        Callable f_;
+
+        thread_state_impl(Callable&& f) : f_(std::forward<Callable>(f))
+          { }
+
+        ~thread_state_impl() { }
+
+        void run()
+          { f_(); }
+      };
+
+    template <class Callable>
+      static thread_state_base* make_state_ptr(Callable&& f) {
+        return new thread_state_impl<Callable>(std::forward<Callable>(f));
+      }
+
+    extern "C" {
+      static void* start_routine(void* p) {
+        auto *t = static_cast<thread_state_base*>(p);
+        t->run();
+        return nullptr;
+      }
+    }
+  } // namespace tiny::detail
+
+  #define __TINYCPP_THREADS__ __cplusplus
+
+  /**
+   * The class `thread` provides a mechanism to create a new thread of execution, to join with a thread (i.e., wait
+   * for a thread to complete), and to perform other operations that manage and query the state of a thread. A
+   * `thread` object uniquely represents a particular thread of execution. That representation may be transferred
+   * to other `thread` objects in such way that no two `thread` object represents that thread. Objects of
+   * class `thread` can be in a state that does not represent a thread of execution.
+   */
+  class thread {
+   public:
+    // types:
+
+    typedef pthread_t native_handle_type; // See [thread.req.native]
+
+    /**
+     * [thread.thread.id]
+     * An object of type `thread::id` provides a unique identifier for each thread of execution and a single distinct
+     * value of all `thread` objects that do not represent a thread of execution ([thread.thread.class]). Each thread of execution has
+     * an associated `thread::id` object that is not equal to the `thread::id` object of any other thread of execution
+     * and that is not equal to the `thread::id` object of any `tiny::thread` object that does not represent threads
+     * of execution.
+     * `thread::id` shall be a trivially copyable class (Clause [class]). The library may reuse the value of a `thread::id`
+     * of a terminated thread that can no longer be joined.
+     */
+    class id {
+     public:
+      /**
+       * @effects: Constructs an object of type `id`.
+       * @postconditions: The constructed object does not represent a thread of execution.
+       */
+      id() noexcept : thread_()
+        { }
+
+      explicit id(native_handle_type thread) : thread_(thread)
+        { }
+
+     public:
+      friend bool operator==(thread::id, thread::id) noexcept;
+      friend bool operator< (thread::id, thread::id) noexcept;
+      template<class charT, class traits>
+        friend std::basic_ostream<charT, traits>&
+          operator<<(std::basic_ostream<charT, traits>&, thread::id);
+
+      friend thread;
+      friend class std::hash<thread::id>;
+
+     private:
+      native_handle_type thread_;
+    };
+
+    // construct/copy/destroy:
+
+    /**
+     * [thread.thread.constr]
+     */
+
+    /**
+     * @effects: Constructs a `thread` object that does not represent a thread of execution.
+     * @postcondition: `get_id() == id()`
+     */
+    thread() noexcept = default;
+
+    /**
+     * Given a function as follows:
+     *  template <class T> typename decay<T>::type decay_copy(T&& v)
+     *    { return std::forward<T>(v); }
+     * 
+     * @requires: `F` and each `Ti` in `Args` shall satisfy the `MoveConstructible` requirements. `INVOKE(decay_-
+     * copy(std::forward<F>(f)), decay_copy(std::forward<Args>(args))...)`([func.require]) shall be a valid
+     * expression.
+     * @effects: Constructs an object of type `thread`. The new thread of execution executes `INVOKE(decay_-
+     * copy(std::forward<F>(f)), decay_copy(std::forward<Args>(args))...)` with the calls to `decay_-
+     * copy` being evaluated in the constructing thread. Any return value from this invocation is ignored.
+     * [Note: This implies that any exceptions not thrown from the invocation of the copy of `f` will be thrown
+     * in the constructing thread, not the new thread. --end note] If the invocation of `INVOKE(decay_-
+     * copy(std::forward<F>(f)), decay_copy(std::forward<Args>(args))...)` terminates with an
+     * uncaught exception, `std::terminate` shall be called.
+     * @synchronization: The completion of the invocation of the constructor synchronizes with the beginning
+     * of the invocation of the copy of `f`.
+     * @postconditions: `get_id() != id()`. `*this` represents the newly started thread.
+     * @throws: `system_error` if unable to start the new thread.
+     * @error_conditions:
+     *  - `resource_unavailable_try_again` -- the system lacked the necessary resources to create an-
+     *    other thread, or the system-imposed limit on the number of threads in a process would be ex-
+     *    ceeded.
+     */
+    template <class F, class ...Args> explicit thread(F&& f, Args&&... args) {
+      auto invoker = detail::thread_invoker<F, Args...>(std::forward<F>(f), std::forward<Args>(args)...);
+      auto *state_ptr = detail::make_state_ptr(std::move(invoker));
+      int errcode = pthread_create(&id_.thread_,
+                                   nullptr, 
+                                   detail::start_routine, 
+                                   state_ptr);
+      if (errcode) {
+        throw std::system_error(errcode, std::generic_category());
+      }
+      // delete state_ptr;
+    }
+
+    thread(const thread&) = delete;
+
+    /**
+     * @effects: Constructs an object of type `thread` from `x`, and sets `x` to a default constructed state.
+     * @postconditions: `x.get_id() == id()` and `get_id()` returns the value of `x.get_id()` prior to the
+     * start of construction.
+     */
+    thread(thread&& x) noexcept {
+      swap(x);
+    }
+
+    /**
+     * [thread.thread.destr]
+     */
+
+    /**
+     * If joinable() then terminate(), otherwise no effects. [Note: Either implicitly detaching or joining
+     * a `joinable()` thread in its destructor could result in difficult to debug correctness (for detach) or
+     * performance (for join) bugs encountered only when an exception is raised. Thus the programmer must
+     * ensure that the destructor is never executed while the thread is still joinable. --end note]
+     */
+    ~thread() {
+      if (joinable()) {
+        std::terminate();
+      }
+    }
+
+    /**
+     * [thread.thread.assign]
+     */
+
+    thread& operator=(const thread&) = delete;
+
+    /**
+     * @effects: If `joinable()`, calls `terminate()`. Otherwise, assigns the state of `x` to `*this` and sets `x` to a
+     * default constructed state.
+     * @postconditions: `x.get_id() == id()` and `get_id()` returns the value of `x.get_id()` prior to the
+     * assignment.
+     */
+    thread& operator=(thread&& x) noexcept {
+      if (joinable()) {
+        std::terminate();
+      }
+      swap(x);
+      return *this;
+    }
+
+    // members:
+
+    /**
+     * [thread.thread.member]
+     */
+
+    /**
+     * @effects: Swaps the state of `*this` and `x`.
+     */
+    void swap(thread& x) noexcept {
+      std::swap(id_, x.id_);
+    }
+
+    /**
+     * @returns: `get_id() != id()`
+     */
+    bool joinable() const noexcept {
+      return !(id_ == id());
+    }
+
+    /**
+     * @requires: `joinable()` is `true`.
+     * @effects: Blocks until the thread represented by `*this` has completed.
+     * @synchronization: The completion of the thread by `*this` synchronizes with ([intro.multithread]) the
+     * corresponding successful `join()` return. [Note: Operations on `*this` are not synchronized. --end
+     * note]
+     * @postconditions: The thread represented by `*this` has completed. `get_id() == id()`.
+     * @throws: `system_error` when an exception is required ([thread.req.exception]).
+     * @error_conditions:
+     *  - `resource_deadlock_would_occur` -- if deadlock is detected or `this->get_id() == tiny::this_-
+     *    thread::get_id()`.
+     *  - `no_such_process` -- if the thread is not valid.
+     *  - `invalid_argument` -- if the thread is not joinable.
+     */
+    void join() {
+      int errcode = joinable() ? pthread_join(id_.thread_, nullptr) : EINVAL;
+      if (errcode) {
+        throw std::system_error(errcode, std::generic_category());
+      }
+      id_ = id();
+    }
+
+    /**
+     * @requires: `joinable()` is `true`.
+     * @effects: The thread represented by `*this` continues execution without the calling thread blocking.
+     * When `detach()` returns, `*this` no longer represents the possibly continuing thread of execution.
+     * When the thread previously represented by `*this` ends execution, the implementation shall release
+     * any owned resources.
+     * @postcondition: `get_id() == id()`.
+     * @throws: `system_error` when an exception is required ([thread.req.exception]).
+     * @error_conditions:
+     *  - `no_such_process` -- if the thread is not valid.
+     *  - `invalid_argument` -- if the thread is not joinable.
+     */
+    void detach() {
+      int errcode = joinable() ? pthread_detach(id_.thread_) : EINVAL;
+      if (errcode) {
+        throw std::system_error(errcode, std::generic_category());
+      }
+      id_ = id();
+    }
+
+    /**
+     * @returns: A default constructed `id` object if `*this` does not represent a thread, otherwise `this_-
+     * thread::get_id()` for the thread of execution represented by `*this`.
+     */
+    id get_id() const noexcept {
+      return id_;
+    }
+
+    // See [thread.req.native]
+    native_handle_type native_handle() {
+      return id_.thread_;
+    }
+
+    // static members:
+
+    /**
+     * [thread.thread.static]
+     */
+
+    /**
+     * @returns: The number of hardware thread contexts. [Note: This value should only be considered to be
+     * a hint. --end note] If this value is not computable or well defined an implementation should return
+     * 0.
+     */
+    static unsigned hardware_concurrency() noexcept {
+      int n = get_nprocs();
+      return n < 0 ? 0 : n;
+    }
+
+   private:
+    id id_;
+  };
+
+  /**
+   * [thread.thread.algorithm]
+   */
+
+  /**
+   * @effects: `x.swap(y)`
+   */
+  inline void swap(thread& x, thread& y) noexcept {
+    x.swap(y);
+  }
+
+  /**
+   * @returns: `true` only if `x` and `y` represent the same thread of execution or neither `x` nor `y` represents a
+   * thread of execution.
+   */
+  inline bool operator==(thread::id x, thread::id y) noexcept {
+    return x.thread_ == y.thread_;
+  }
+  /**
+   * @returns: `!(x == y)`
+   */
+  inline bool operator!=(thread::id x, thread::id y) noexcept {
+    return !(x == y);
+  }
+  /**
+   * @returns: A value such that `operator<`` is a total ordering as described in [alg.sorting].
+   */
+  inline bool operator< (thread::id x, thread::id y) noexcept {
+    return x.thread_ < y.thread_;
+  }
+  /**
+   * @returns: `!(y < x)`
+   */
+  inline bool operator<=(thread::id x, thread::id y) noexcept {
+    return !(y < x);
+  }
+  /**
+   * @returns: `y < x`
+   */
+  inline bool operator> (thread::id x, thread::id y) noexcept {
+    return y < x;
+  }
+  /**
+   * @returns: `!(x < y)`
+   */
+  inline bool operator>=(thread::id x, thread::id y) noexcept {
+    return !(x < y);
+  }
+
+  /**
+   * @effects: Inserts an unspecified text represeentation of `id` into `out`. For two objects of type `thread::id`
+   * `x` and `y`, if `x == y` the `thread::id` objects shall have the same text representation and if `x != y`` the
+   * `thread::id` objects shall have distinct text representations.
+   * @returns: out
+   */
+  template<class charT, class traits>
+    inline std::basic_ostream<charT, traits>&
+      operator<< (std::basic_ostream<charT, traits>& out, thread::id id) {
+        if (id == thread::id()) {
+          return out << "not a thread of execution";
+        } else {
+          return out << id.thread_;
+        }
+      }
+
+  // [thread.thread.this]
+  namespace this_thread {
+    /**
+     * @returns An object of type `thread::id` that uniquely identifies the current thread of execution. No
+     * other thread of exception shall have this id and this thread of execution shall always have this id. The
+     * object returned shall not compare equal to a default constructed `thread::id`.
+     */
+    inline thread::id get_id() noexcept {
+      return thread::id(pthread_self());
+    }
+
+    /**
+     * @effects: Offers the implementation the opportunity to reschedule.
+     * @syncronization: None.
+     */
+    inline void yield() noexcept {
+      pthread_yield();
+    }
+
+    /**
+     * @effects: Blocks the calling thread for the relative timeout [thread.req.timing] specified by `rel_time`.
+     * @syncronization: None.
+     */
+    template <class Rep, class Period>
+      inline void sleep_for(const std::chrono::duration<Rep, Period>& rel_time) noexcept {
+        if (rel_time <= rel_time.zero()) {
+          return;
+        }
+
+        auto s = std::chrono::duration_cast<std::chrono::seconds>(rel_time);
+        auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(rel_time - s);
+
+        timespec ts = {
+          static_cast<time_t>(s.count()),
+          static_cast<long>(ns.count())
+        };
+
+        while (nanosleep(&ts, &ts) == -1 && errno == EINTR)
+          { }
+      }
+
+    /**
+     * @effects: Blocks the calling thread for the absolute timeout [thread.req.timing] specified by `abs_time`.
+     * @syncronization: None.
+     */
+    template <class Clock, class Duration>
+      inline void sleep_until(const std::chrono::time_point<Clock, Duration>& abs_time) noexcept {
+        auto now = Clock::now();
+        if (Clock::is_steady) {
+          if (now < abs_time) {
+            sleep_for(abs_time - now);
+          }
+        } else {
+          while (now < abs_time) {
+            sleep_for(abs_time - now);
+            now = Clock::now();
+          }
+        }
+      }
+
+  } // namespace tiny::this_thread
+} // namespace tiny
+
+namespace std {
+  // Hash support
+
+  template <class T> struct hash;
+
+  /**
+   * @requires: the template specialization shall meet the requirements of class template `hash` ([unord.hash]).
+   */
+  template <> struct hash<tiny::thread::id> {
+    std::size_t operator()(const tiny::thread::id &id) const noexcept {
+      return hash<tiny::thread::native_handle_type>{}(id.thread_);
+    }
+  };
+} // namespace std
+  
+#endif // C++11
+
+#endif // _LIBTINYCXX_THREAD
